@@ -1,0 +1,132 @@
+name: Deploy iOS Application
+description: Builds and deploys an iOS application to App Store Connect
+
+inputs:
+  certificate:
+    description: Base64-encoded signing certificate
+    required: true
+
+  profile:
+    description: Base64-encoded provisioning profile
+    required: true
+
+  key:
+    description: Base64-encoded App Store Connect key
+    required: true
+
+  keyId:
+    description: App Store Connect key ID
+    required: true
+  
+  keyIssuerId:
+    description: App Store Connect issuer ID
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Create Keychain
+      shell: bash
+      run: |
+        KEYCHAIN_PATH="$RUNNER_TEMP/login.keychain"
+        echo "KEYCHAIN_PATH=$KEYCHAIN_PATH" >> $GITHUB_ENV
+
+        security create-keychain -p "" $KEYCHAIN_PATH
+        security set-keychain-settings -lut 21600 $KEYCHAIN_PATH
+        security unlock-keychain -p "" $KEYCHAIN_PATH
+
+    - name: Install Certificate
+      shell: bash
+      run: |
+        CERTIFICATE_PATH="$RUNNER_TEMP/certificate.p12"
+        echo -n "${{ inputs.certificate }}" | base64 --decode -o $CERTIFICATE_PATH
+        security import $CERTIFICATE_PATH -P "password" -A -t cert -f pkcs12 -k ${{ env.KEYCHAIN_PATH }}
+        security set-key-partition-list -S apple-tool:,apple: -k "" ${{ env.KEYCHAIN_PATH }}
+
+    - name: Install Provisioning Profile
+      shell: bash
+      run: |
+        PROFILE_FOLDER="$HOME/Library/Developer/Xcode/UserData/Provisioning Profiles"
+        PROFILE_PATH="$PROFILE_FOLDER/profile.mobileprovision"
+        mkdir -p "$PROFILE_FOLDER"
+        echo -n "${{ inputs.profile }}" | base64 --decode -o "$PROFILE_PATH"
+        PROVISIONING_PROFILE_UUID=$(security cms -D -i "$PROFILE_PATH" | plutil -extract UUID raw -)
+        echo "PROVISIONING_PROFILE_UUID=$PROVISIONING_PROFILE_UUID" >> $GITHUB_ENV
+
+    - name: Write Authentication Key
+      shell: bash
+      run: |
+        AUTHENTICATION_KEY_PATH="$RUNNER_TEMP/key.p8"
+        echo -n "${{ inputs.key }}" | base64 --decode -o $AUTHENTICATION_KEY_PATH
+        echo "AUTHENTICATION_KEY_PATH=$AUTHENTICATION_KEY_PATH" >> $GITHUB_ENV
+
+    - name: Increment Build Number
+      shell: bash
+      run: agvtool next-version -all
+
+    - name: Write Export Options
+      shell: bash
+      run: |
+        BUNDLE_IDENTIFIER=$(xcodebuild -showBuildSettings -json | jq --raw-output '.[0].buildSettings.PRODUCT_BUNDLE_IDENTIFIER')
+        EXPORT_OPTIONS_PATH="$RUNNER_TEMP/export_options.plist"
+        echo "EXPORT_OPTIONS_PATH=$EXPORT_OPTIONS_PATH" >> $GITHUB_ENV
+
+        cat > $EXPORT_OPTIONS_PATH <<EOF
+        <?xml version="1.0" encoding="UTF-8"?>
+        <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+        <plist version="1.0">
+          <dict>
+            <key>destination</key>
+            <string>upload</string>
+            <key>method</key>
+            <string>app-store-connect</string>
+            <key>signingStyle</key>
+            <string>manual</string>
+            <key>provisioningProfiles</key>
+            <dict>
+              <key>$BUNDLE_IDENTIFIER</key>
+              <string>${{ env.PROVISIONING_PROFILE_UUID }}</string>
+            </dict>
+          </dict>
+        </plist>
+        EOF
+
+    - name: Set Scheme
+      shell: bash
+      run: |
+        SCHEME="$(xcodebuild -list -json | jq --raw-output '.project.schemes[0]')"
+        echo "SCHEME=$SCHEME" >> $GITHUB_ENV
+
+    - name: Install Dependencies
+      shell: bash
+      run: |
+        xcodebuild \
+          -scheme ${{ env.SCHEME }} \
+          -resolvePackageDependencies
+
+    - name: Set Archive Path
+      shell: bash
+      run: |
+        ARCHIVE_PATH="$RUNNER_TEMP/${{ env.SCHEME }}.xcarchive"
+        echo "ARCHIVE_PATH=$ARCHIVE_PATH" >> $GITHUB_ENV
+
+    - name: Create Archive
+      shell: bash
+      run: |
+        xcodebuild \
+          -scheme ${{ env.SCHEME }} \
+          -sdk iphoneos \
+          -destination 'generic/platform=iOS' \
+          -archivePath ${{ env.ARCHIVE_PATH }} \
+          archive
+
+    - name: Upload Archive
+      shell: bash
+      run: |
+        xcodebuild \
+          -exportArchive \
+          -exportOptionsPlist ${{ env.EXPORT_OPTIONS_PATH }} \
+          -archivePath ${{ env.ARCHIVE_PATH }} \
+          -authenticationKeyPath ${{ env.AUTHENTICATION_KEY_PATH }} \
+          -authenticationKeyID ${{ inputs.keyId }} \
+          -authenticationKeyIssuerID ${{ inputs.keyIssuerId }}
